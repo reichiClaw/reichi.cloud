@@ -228,6 +228,9 @@ Ausführen erhalten, nur das Binary wird auf die gewünschte Version gebracht.
   - **CIFS/SMB**: kein `chown` möglich. Das Script setzt `uid=101500,gid=101500` in den bestehenden
     `pvesm --options` (bestehende Optionen bleiben erhalten) und hängt das Storage neu ein.
   - **NFS**: `chown` klappt nur mit `no_root_squash`; sonst das Verzeichnis auf dem NFS-Server auf `101500` setzen.
+    Der Schreibtest erfolgt über einen temporären Bind-Mount, weil `/mnt/pve/<Storage>` oft `0700` ist und uid `101500`
+    den Parent sonst nicht durchqueren kann – der Container sieht nur den gemounteten Ordner. `all_squash` auf dem
+    Export muss aus sein, sonst schreibt der NAS als `nobody`.
 - Große Uploads: Ohne Reverse Proxy gibt es kein `client_max_body_size`-Limit; Chunk-Größen werden
   in der Cloudreve-Speicherrichtlinie konfiguriert.
 - Backups: Container per Proxmox-Backup sichern. Ein Bind-Mount (`DATA_HOST_DIR`) wird von `vzdump`

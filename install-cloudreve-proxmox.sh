@@ -233,9 +233,11 @@ preflight() {
     [[ "$DATA_HOST_DIR" == /* ]] || die "DATA_HOST_DIR muss ein absoluter Pfad sein: $DATA_HOST_DIR"
     [[ "$DATA_DISK_GB" -eq 0 ]] || die "DATA_HOST_DIR und DATA_DISK_GB schliessen sich aus."
     local parent="$DATA_HOST_DIR"
-    while [[ ! -d "$parent" && "$parent" != "/" ]]; do parent=$(dirname "$parent"); done
+    while [[ "$parent" != "/" ]] && ! mountpoint -q "$parent" 2>/dev/null; do
+      parent=$(dirname "$parent")
+    done
     if ! mountpoint -q "$parent" 2>/dev/null && [[ "$DATA_HOST_DIR" == /mnt/* ]]; then
-      warn "$parent ist kein eigener Mountpoint - sicher, dass das Storage unter $DATA_HOST_DIR gemountet ist?"
+      warn "$DATA_HOST_DIR liegt unter keinem Mountpoint - sicher, dass das Storage gemountet ist?"
     fi
   fi
 
@@ -347,13 +349,23 @@ remount_pve_storage() {
 
 host_can_write_as() {
   local dir=$1 uid=$2
-  if command -v setpriv >/dev/null 2>&1; then
-    # shellcheck disable=SC2016
-    setpriv --reuid="$uid" --regid="$uid" --clear-groups -- \
-      sh -c 'f="$1/.host-rw.$$"; : > "$f" && rm -f "$f"' sh "$dir"
-  else
-    return 0
+  local tmp rc=0
+  command -v setpriv >/dev/null 2>&1 || return 0
+  # Nicht direkt über $dir testen: /mnt/pve/<storage> ist oft 0700 (root), dann
+  # scheitert uid $uid am Parent, obwohl der Container das Verzeichnis per
+  # Bind-Mount ohne den Parent-Pfad erreicht.
+  tmp=$(mktemp -d /tmp/cr-rwtest.XXXXXX)
+  chmod 755 "$tmp"
+  if ! mount --bind "$dir" "$tmp"; then
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
   fi
+  # shellcheck disable=SC2016
+  setpriv --reuid="$uid" --regid="$uid" --clear-groups -- \
+    sh -c 'f="$1/.host-rw.$$"; : > "$f" && rm -f "$f"' sh "$tmp" || rc=$?
+  umount "$tmp" 2>/dev/null || umount -l "$tmp" 2>/dev/null || true
+  rmdir "$tmp" 2>/dev/null || true
+  return "$rc"
 }
 
 prepare_data_dir() {
@@ -399,7 +411,14 @@ prepare_data_dir() {
   esac
   chmod 750 "$DATA_HOST_DIR" 2>/dev/null || true
   if ! host_can_write_as "$DATA_HOST_DIR" "$want"; then
-    die "uid $want kann nicht in $DATA_HOST_DIR schreiben (Dateisystem $fstype, Owner $(stat -c %u:%g "$DATA_HOST_DIR"))."
+    warn "uid $want kann nicht in $DATA_HOST_DIR schreiben (Dateisystem $fstype, $(stat -c 'Owner %u:%g %A' "$DATA_HOST_DIR"))."
+    if [[ "$fstype" == nfs || "$fstype" == nfs4 ]]; then
+      warn "Der Container wuerde dort genauso scheitern. Auf dem NFS-Server pruefen:"
+      warn "  - kein all_squash (mappt jede UID auf nobody)"
+      warn "  - chmod u+w auf dem Ordner, Owner UID $want (unprivilegierter LXC: 100000+${SERVICE_UID})"
+      warn "  - NFS4-Idmap: numerische UID $want muss auf dem NAS existieren oder idmapping aus (nfsd-Disable)"
+    fi
+    die "Datenverzeichnis nicht beschreibbar."
   fi
   log "Dateisystem: $fstype, Owner: $(stat -c %u:%g "$DATA_HOST_DIR")"
 }
