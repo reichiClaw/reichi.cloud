@@ -558,12 +558,24 @@ start_container() {
 }
 
 set_root_password() {
+  local pwfile="/root/cloudreve-${CTID}.root-password"
+  if [[ "$RESUME" == "1" && -z "$CT_PASSWORD" ]]; then
+    log "Resume: root-Passwort des Containers bleibt unveraendert${pwfile:+ (siehe $pwfile, falls beim ersten Lauf geschrieben)}."
+    GENERATED_PASSWORD=0
+    return 0
+  fi
   if [[ -z "$CT_PASSWORD" ]]; then
     CT_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
     GENERATED_PASSWORD=1
   fi
   # ueber stdin, damit das Passwort nicht in der Prozessliste auftaucht
   printf 'root:%s\n' "$CT_PASSWORD" | ct_exec chpasswd
+  if [[ "${GENERATED_PASSWORD:-0}" == "1" ]]; then
+    umask 077
+    printf '%s\n' "$CT_PASSWORD" > "$pwfile"
+    chmod 600 "$pwfile"
+    log "Container-root-Passwort nach $pwfile geschrieben."
+  fi
 }
 
 run_setup() {
@@ -599,7 +611,7 @@ print_summary() {
  NAT:              $( [[ "$NAT_FORWARD" == "1" ]] && echo "$PUBLIC_IP ($WAN_IFACE) TCP $NAT_PORTS -> ${CT_IP%%/*}  [$NAT_SCRIPT, cloudreve-nat.service]" || echo "keins (Container ist direkt erreichbar)" )
  Daten:            $( [[ -n "$DATA_HOST_DIR" ]] && echo "$DATA_HOST_DIR (Host) -> $CT_DATA_DIR" || echo "$CT_DATA_DIR im Container" )
  Template:         $TEMPLATE
- Root-Passwort:    $( [[ "${GENERATED_PASSWORD:-0}" == "1" ]] && echo "$CT_PASSWORD  (generiert - bitte notieren!)" || echo "(wie vorgegeben)" )
+ Root-Passwort:    $( [[ "${GENERATED_PASSWORD:-0}" == "1" ]] && echo "$CT_PASSWORD  (generiert, Kopie in /root/cloudreve-${CTID}.root-password)" || echo "(unverändert; Reset: pct exec $CTID -- passwd)" )
 
  Zugriff:          pct enter $CTID
  Logs:             pct exec $CTID -- journalctl -u cloudreve -f
