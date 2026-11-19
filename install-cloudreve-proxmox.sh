@@ -8,8 +8,9 @@
 #
 # Aufruf auf dem Proxmox-Host als root, z.B.:
 #
-#   # Container an privater Bridge, oeffentliche IP am Host (DNAT 80/443):
-#   CT_IP=10.2.0.5 BRIDGE=vmbr1 PUBLIC_IP=91.112.42.60 \
+#   # Container an privater Bridge, oeffentliche IP am Host (DNAT 80/443);
+#   # BRIDGE_IP nur noetig, wenn der Host auf der Bridge noch keine IP hat:
+#   CT_IP=10.2.0.5 BRIDGE=vmbr1 BRIDGE_IP=10.2.0.1/24 PUBLIC_IP=91.112.42.60 \
 #   DATA_HOST_DIR=/mnt/pve/CloudStorage/cloudreve LE_EMAIL=admin@reichi.cloud \
 #     bash install-cloudreve-proxmox.sh
 #
@@ -45,6 +46,8 @@ PUBLIC_IP6="${PUBLIC_IP6:-}"             # optional: IPv6 des Containers mit CID
 GATEWAY6="${GATEWAY6:-}"                 # optional: IPv6-Gateway
 CT_MAC="${CT_MAC:-}"                     # optional: feste MAC (manche Hoster verlangen das fuer Zusatz-IPs)
 BRIDGE="${BRIDGE:-vmbr0}"
+BRIDGE_IP="${BRIDGE_IP:-}"               # optional: IPv4/CIDR, die der Host auf $BRIDGE bekommen soll (z.B. 10.2.0.1/24),
+                                         # falls die Bridge noch keine hat; wird in /etc/network/interfaces persistiert
 DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 9.9.9.9}"
 
 CTID="${CTID:-}"                         # leer = naechste freie ID
@@ -95,7 +98,53 @@ ct_exec() { pct exec "$CTID" -- "$@"; }
 # Erste IPv4 (mit CIDR) des Hosts auf der Bridge, z.B. 10.2.0.1/24
 bridge_addr() { { ip -4 -o addr show dev "$BRIDGE" 2>/dev/null || true; } | awk '{print $4; exit}'; }
 
+bridge_has_address_in_interfaces() {
+  awk -v br="$BRIDGE" '
+    $1=="iface" && $2==br {in_stanza=1; next}
+    /^(iface|auto|allow-|source)/ {in_stanza=0}
+    in_stanza && $1=="address" {found=1}
+    END {exit !found}' /etc/network/interfaces
+}
+
+configure_bridge_ip() {
+  [[ -n "$BRIDGE_IP" ]] || return 0
+  valid_ipv4_cidr "$BRIDGE_IP" || die "BRIDGE_IP muss IPv4 mit CIDR sein, z.B. 10.2.0.1/24 (aktuell: $BRIDGE_IP)."
+
+  local current
+  current=$(bridge_addr)
+  if [[ "$current" == "$BRIDGE_IP" ]]; then
+    log "$BRIDGE hat bereits $BRIDGE_IP."
+    return 0
+  fi
+  if [[ -n "$current" ]]; then
+    die "$BRIDGE hat bereits $current - BRIDGE_IP=$BRIDGE_IP passt nicht dazu. BRIDGE_IP weglassen oder angleichen."
+  fi
+
+  local f=/etc/network/interfaces backup
+  grep -qE "^iface $BRIDGE inet " "$f" || die "$BRIDGE ist nicht in $f definiert - bitte die Bridge-IP in der Proxmox-UI (Node -> Network) setzen."
+  backup="$f.bak-cloudreve-$(date +%Y%m%d%H%M%S)"
+  cp -a "$f" "$backup"
+  log "Setze $BRIDGE_IP auf $BRIDGE (Backup: $backup) ..."
+
+  if grep -qE "^iface $BRIDGE inet manual" "$f"; then
+    sed -i "s|^iface $BRIDGE inet manual|iface $BRIDGE inet static\n\taddress $BRIDGE_IP|" "$f"
+  elif grep -qE "^iface $BRIDGE inet static" "$f" && ! bridge_has_address_in_interfaces; then
+    sed -i "/^iface $BRIDGE inet static/a\\\taddress $BRIDGE_IP" "$f"
+  else
+    die "Unerwartete Konfiguration fuer $BRIDGE in $f - bitte die IP manuell in der Proxmox-UI setzen."
+  fi
+
+  if command -v ifreload >/dev/null 2>&1; then
+    ifreload -a || die "ifreload -a fehlgeschlagen; $f wurde geaendert (Backup: $backup)."
+  else
+    ip addr add "$BRIDGE_IP" dev "$BRIDGE"
+  fi
+  ip link set "$BRIDGE" up
+  [[ "$(bridge_addr)" == "$BRIDGE_IP" ]] || die "$BRIDGE hat nach dem Reload nicht $BRIDGE_IP."
+}
+
 resolve_network() {
+  configure_bridge_ip
   # Abwaertskompatibel: frueher wurde die Container-IP als PUBLIC_IP=<ip>/<cidr> uebergeben.
   if [[ -z "$CT_IP" && "$PUBLIC_IP" == */* ]]; then
     CT_IP="$PUBLIC_IP"; PUBLIC_IP="${PUBLIC_IP%%/*}"
@@ -117,7 +166,7 @@ resolve_network() {
   valid_ipv4_cidr "$CT_IP" || die "CT_IP muss IPv4 (optional mit CIDR) sein, aktuell: $CT_IP"
 
   if [[ -z "$GATEWAY" ]]; then
-    [[ -n "$br_addr" ]] || die "GATEWAY fehlt und $BRIDGE hat keine IPv4-Adresse, aus der es abgeleitet werden kann."
+    [[ -n "$br_addr" ]] || die "GATEWAY fehlt und $BRIDGE hat keine IPv4-Adresse. Fuer NAT-Betrieb braucht der Host eine IP im Container-Netz: z.B. BRIDGE_IP=10.2.0.1/24 mitgeben (setzt das Script) oder in der Proxmox-UI unter Node -> Network -> $BRIDGE eintragen."
     GATEWAY="${br_addr%%/*}"
     log "GATEWAY nicht angegeben, verwende Host-IP auf $BRIDGE: $GATEWAY"
   fi

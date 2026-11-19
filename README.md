@@ -44,13 +44,16 @@ cd reichi.cloud
 ```bash
 CT_IP=10.2.0.5 \
 BRIDGE=vmbr1 \
+BRIDGE_IP=10.2.0.1/24 \
 PUBLIC_IP=91.112.42.60 \
 DATA_HOST_DIR=/mnt/pve/CloudStorage/cloudreve \
 LE_EMAIL=admin@reichi.cloud \
 bash install-cloudreve-proxmox.sh
 ```
 
-`GATEWAY` wird aus der Host-IP auf `vmbr1` abgeleitet, die Netzmaske ebenfalls. Der Host bekommt
+Der Host braucht eine IP im Container-Netz (er ist das Gateway). Hat `vmbr1` noch keine, setzt
+`BRIDGE_IP` sie: `/etc/network/interfaces` wird (mit Backup) angepasst und per `ifreload -a` aktiviert.
+Hat die Bridge bereits eine IP, `BRIDGE_IP` weglassen. `GATEWAY` und Netzmaske werden daraus abgeleitet. Der Host bekommt
 `/usr/local/sbin/cloudreve-nat` plus `cloudreve-nat.service` (iptables DNAT 80/443 → Container,
 SNAT für ausgehenden Container-Traffic, `ip_forward=1`) – idempotent, überlebt Reboots.
 
@@ -101,6 +104,7 @@ Alle Werte werden als Umgebungsvariablen übergeben.
 | `PUBLIC_IP6` / `GATEWAY6` | leer | Optional IPv6 mit CIDR + Gateway |
 | `CT_MAC` | leer | Feste MAC-Adresse (manche Hoster verlangen das für Zusatz-IPs) |
 | `BRIDGE` | `vmbr0` | Proxmox-Bridge |
+| `BRIDGE_IP` | leer | IPv4/CIDR, die der Host auf `BRIDGE` bekommen soll (z. B. `10.2.0.1/24`), falls die Bridge noch keine hat; wird in `/etc/network/interfaces` persistiert |
 | `DNS_SERVERS` | `1.1.1.1 9.9.9.9` | Resolver im Container |
 | `CTID` | nächste freie ID | Container-ID |
 | `CT_HOSTNAME` | `cloudreve` | Hostname |
