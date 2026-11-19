@@ -39,25 +39,44 @@ git clone https://github.com/reichiClaw/reichi.cloud.git
 cd reichi.cloud
 ```
 
-### Variante A: private Bridge, öffentliche IP am Host (NAT)
+### Variante A: Bridge im LAN, externer Router leitet die öffentliche IP weiter
+
+`vmbr1` hängt an einer NIC im Netz `10.2.0.0/24`; der Router dort (hier `10.2.0.1`) macht NAT
+und leitet TCP 80/443 der öffentlichen IP auf den Container weiter. Der Proxmox-Host braucht
+keine eigene IP auf der Bridge.
 
 ```bash
 CT_IP=10.2.0.5 \
+GATEWAY=10.2.0.1 \
 BRIDGE=vmbr1 \
-BRIDGE_IP=10.2.0.1/24 \
 PUBLIC_IP=91.112.42.60 \
 DATA_HOST_DIR=/mnt/pve/CloudStorage/cloudreve \
 LE_EMAIL=admin@reichi.cloud \
 bash install-cloudreve-proxmox.sh
 ```
 
-Der Host braucht eine IP im Container-Netz (er ist das Gateway). Hat `vmbr1` noch keine, setzt
-`BRIDGE_IP` sie: `/etc/network/interfaces` wird (mit Backup) angepasst und per `ifreload -a` aktiviert.
-Hat die Bridge bereits eine IP, `BRIDGE_IP` weglassen. `GATEWAY` und Netzmaske werden daraus abgeleitet. Der Host bekommt
-`/usr/local/sbin/cloudreve-nat` plus `cloudreve-nat.service` (iptables DNAT 80/443 → Container,
-SNAT für ausgehenden Container-Traffic, `ip_forward=1`) – idempotent, überlebt Reboots.
+`PUBLIC_IP` dient hier nur dem DNS-Check im Container. Weil die IP nicht auf dem Host liegt,
+richtet das Script kein NAT ein (Port-Forwarding ist Sache des Routers).
 
-### Variante B: Container hat die öffentliche IP selbst
+### Variante B: private Bridge, öffentliche IP am Proxmox-Host (NAT am Host)
+
+```bash
+CT_IP=10.2.0.5 \
+BRIDGE=vmbr1 \
+BRIDGE_IP=10.2.0.1/24 \
+PUBLIC_IP=91.112.42.60 \
+LE_EMAIL=admin@reichi.cloud \
+bash install-cloudreve-proxmox.sh
+```
+
+Der Host ist hier Gateway und braucht eine IP im Container-Netz. Hat `vmbr1` noch keine, setzt
+`BRIDGE_IP` sie: `/etc/network/interfaces` wird (mit Backup) angepasst und per `ifreload -a` aktiviert;
+hat die Bridge bereits eine IP, `BRIDGE_IP` weglassen. `GATEWAY` und Netzmaske werden daraus abgeleitet.
+Weil `PUBLIC_IP` auf dem Host liegt, bekommt er `/usr/local/sbin/cloudreve-nat` plus
+`cloudreve-nat.service` (iptables DNAT 80/443 → Container, SNAT für ausgehenden Container-Traffic,
+`ip_forward=1`) – idempotent, überlebt Reboots. Mit `NAT_FORWARD=0/1` lässt sich die Automatik übersteuern.
+
+### Variante C: Container hat die öffentliche IP selbst
 
 ```bash
 CT_IP=203.0.113.10/24 \
@@ -73,7 +92,7 @@ Das Script
 3. legt einen unprivilegierten Container an (Default: 2 Cores, 2 GB RAM, 16 GB Disk) inkl. Bind-Mount
    nach `/opt/cloudreve/data`,
 4. setzt die statische IP, DNS, Autostart und einen Proxmox-Firewall-Regelsatz (22/80/443),
-5. richtet bei Variante A das Port-Forwarding am Host ein,
+5. richtet bei Variante B das Port-Forwarding am Host ein,
 6. startet den Container, setzt ein zufälliges root-Passwort (wird am Ende angezeigt),
 7. kopiert `cloudreve-setup.sh` in den Container und führt es aus.
 
@@ -95,7 +114,7 @@ Alle Werte werden als Umgebungsvariablen übergeben.
 | --- | --- | --- |
 | `CT_IP` | – (Pflicht) | IPv4 des Containers, mit oder ohne CIDR (`10.2.0.5` oder `203.0.113.10/24`); ohne CIDR wird die Maske der Bridge übernommen |
 | `GATEWAY` | Host-IP auf `BRIDGE` | IPv4-Gateway des Containers |
-| `PUBLIC_IP` | leer | Öffentliche IPv4 (ohne CIDR), unter der die Domain erreichbar ist; weicht sie von `CT_IP` ab, wird NAT eingerichtet |
+| `PUBLIC_IP` | leer | Öffentliche IPv4 (ohne CIDR), unter der die Domain erreichbar ist (DNS-Check im Container); liegt sie auf dem Host und weicht von `CT_IP` ab, wird NAT am Host eingerichtet |
 | `NAT_FORWARD` | `auto` | `1`/`0` erzwingt bzw. unterdrückt das Port-Forwarding |
 | `NAT_PORTS` | `80 443` | Weitergeleitete TCP-Ports |
 | `WAN_IFACE` | Default-Route | Host-Interface mit der öffentlichen IP (für SNAT) |

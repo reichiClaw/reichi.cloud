@@ -8,11 +8,14 @@
 #
 # Aufruf auf dem Proxmox-Host als root, z.B.:
 #
-#   # Container an privater Bridge, oeffentliche IP am Host (DNAT 80/443);
-#   # BRIDGE_IP nur noetig, wenn der Host auf der Bridge noch keine IP hat:
-#   CT_IP=10.2.0.5 BRIDGE=vmbr1 BRIDGE_IP=10.2.0.1/24 PUBLIC_IP=91.112.42.60 \
+#   # Bridge im LAN 10.2.0.0/24, Router leitet die oeffentliche IP auf den Container:
+#   CT_IP=10.2.0.5 GATEWAY=10.2.0.1 BRIDGE=vmbr1 PUBLIC_IP=91.112.42.60 \
 #   DATA_HOST_DIR=/mnt/pve/CloudStorage/cloudreve LE_EMAIL=admin@reichi.cloud \
 #     bash install-cloudreve-proxmox.sh
+#
+#   # Private Bridge, oeffentliche IP am Host (DNAT 80/443 wird eingerichtet):
+#   CT_IP=10.2.0.5 BRIDGE=vmbr1 BRIDGE_IP=10.2.0.1/24 PUBLIC_IP=91.112.42.60 \
+#   LE_EMAIL=admin@reichi.cloud bash install-cloudreve-proxmox.sh
 #
 #   # Container hat die oeffentliche IP selbst:
 #   CT_IP=203.0.113.10/24 GATEWAY=203.0.113.1 LE_EMAIL=admin@reichi.cloud \
@@ -31,10 +34,13 @@ DOMAIN="${DOMAIN:-reichi.cloud}"
 LE_EMAIL="${LE_EMAIL:-}"                 # Pflicht: E-Mail fuer Let's Encrypt
 
 # --- Netzwerk ----------------------------------------------------------------
-# Zwei Betriebsarten:
+# Drei Betriebsarten:
 #  a) Container hat die oeffentliche IP selbst:  CT_IP=203.0.113.10/24 GATEWAY=203.0.113.1
-#  b) Container haengt an einer privaten Bridge, die oeffentliche IP liegt am Host:
-#     CT_IP=10.2.0.5 BRIDGE=vmbr1 PUBLIC_IP=91.112.42.60
+#  b) Bridge haengt an einem LAN mit eigenem Router, der die oeffentliche IP auf den
+#     Container weiterleitet:  CT_IP=10.2.0.5 GATEWAY=10.2.0.1 BRIDGE=vmbr1 PUBLIC_IP=91.112.42.60
+#     -> kein NAT am Host (PUBLIC_IP dient nur dem DNS-Check).
+#  c) Private Bridge, die oeffentliche IP liegt am Proxmox-Host selbst:
+#     CT_IP=10.2.0.5 BRIDGE=vmbr1 BRIDGE_IP=10.2.0.1/24 PUBLIC_IP=91.112.42.60
 #     -> Script richtet DNAT (80/443) vom Host auf den Container ein.
 CT_IP="${CT_IP:-}"                       # Pflicht: IPv4 des Containers, mit oder ohne CIDR
 GATEWAY="${GATEWAY:-}"                   # IPv4-Gateway; leer = IP des Hosts auf $BRIDGE
@@ -159,14 +165,14 @@ resolve_network() {
     if [[ -n "$br_addr" ]]; then
       CT_IP="$CT_IP/${br_addr##*/}"
     else
-      warn "Keine IPv4 auf $BRIDGE gefunden, nehme /24 fuer $CT_IP an."
+      log "Keine IPv4 auf $BRIDGE, nehme /24 fuer $CT_IP an (sonst CT_IP mit CIDR angeben)."
       CT_IP="$CT_IP/24"
     fi
   fi
   valid_ipv4_cidr "$CT_IP" || die "CT_IP muss IPv4 (optional mit CIDR) sein, aktuell: $CT_IP"
 
   if [[ -z "$GATEWAY" ]]; then
-    [[ -n "$br_addr" ]] || die "GATEWAY fehlt und $BRIDGE hat keine IPv4-Adresse. Fuer NAT-Betrieb braucht der Host eine IP im Container-Netz: z.B. BRIDGE_IP=10.2.0.1/24 mitgeben (setzt das Script) oder in der Proxmox-UI unter Node -> Network -> $BRIDGE eintragen."
+    [[ -n "$br_addr" ]] || die "GATEWAY fehlt und $BRIDGE hat keine IPv4-Adresse. Entweder GATEWAY=<Router-IP im Container-Netz> angeben (Bridge haengt an einem LAN mit eigenem Router) oder BRIDGE_IP=10.2.0.1/24 setzen, wenn der Proxmox-Host selbst Gateway/NAT fuer den Container sein soll."
     GATEWAY="${br_addr%%/*}"
     log "GATEWAY nicht angegeben, verwende Host-IP auf $BRIDGE: $GATEWAY"
   fi
@@ -176,8 +182,20 @@ resolve_network() {
     valid_ipv4 "$PUBLIC_IP" || die "PUBLIC_IP muss eine IPv4 ohne CIDR sein: $PUBLIC_IP"
   fi
 
+  local public_ip_on_host=0
+  if [[ -n "$PUBLIC_IP" ]] && ip -4 -o addr show | grep -q " ${PUBLIC_IP}/"; then
+    public_ip_on_host=1
+  fi
+
   if [[ "$NAT_FORWARD" == "auto" ]]; then
-    if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "${CT_IP%%/*}" ]]; then NAT_FORWARD=1; else NAT_FORWARD=0; fi
+    NAT_FORWARD=0
+    if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "${CT_IP%%/*}" ]]; then
+      if [[ "$public_ip_on_host" == "1" ]]; then
+        NAT_FORWARD=1
+      else
+        log "PUBLIC_IP $PUBLIC_IP liegt nicht auf diesem Host -> kein NAT am Host. Das Port-Forwarding 80/443 -> ${CT_IP%%/*} muss auf dem Router passieren."
+      fi
+    fi
   fi
 
   if [[ "$NAT_FORWARD" == "1" ]]; then
@@ -187,9 +205,7 @@ resolve_network() {
       WAN_IFACE=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     fi
     [[ -n "$WAN_IFACE" ]] || die "WAN_IFACE konnte nicht ermittelt werden (keine Default-Route?). Bitte WAN_IFACE=... setzen."
-    if ! ip -4 -o addr show | grep -q " ${PUBLIC_IP}/"; then
-      warn "PUBLIC_IP $PUBLIC_IP ist auf diesem Host auf keinem Interface konfiguriert - DNAT greift nur, wenn der Traffic hier ankommt."
-    fi
+    [[ "$public_ip_on_host" == "1" ]] || warn "PUBLIC_IP $PUBLIC_IP ist auf diesem Host auf keinem Interface konfiguriert - DNAT greift nur, wenn der Traffic hier ankommt."
   fi
 }
 
