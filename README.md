@@ -174,8 +174,8 @@ DOMAIN=reichi.cloud LE_EMAIL=admin@reichi.cloud bash cloudreve-setup.sh
 
 ```
 /opt/cloudreve/cloudreve              Binary (läuft als Systemuser "cloudreve")
-/opt/cloudreve/data/conf.ini          Konfiguration ([SSL], [Database], [Redis])
-/opt/cloudreve/data/ssl/*.pem         Zertifikat, das Cloudreve lädt
+/opt/cloudreve/data/conf.ini          Konfiguration ([SSL], [Database], [Redis]; data/ liegt auf dem Bind-Mount)
+/opt/cloudreve/ssl/*.pem              Zertifikat (lokal auf der Container-Disk, nicht auf dem NAS)
 /etc/systemd/system/cloudreve.service Dienst (CAP_NET_BIND_SERVICE für Port 443, gehärtet)
 /etc/letsencrypt/renewal-hooks/deploy/cloudreve.sh
                                       kopiert nach jeder Erneuerung das Zertifikat & startet Cloudreve neu

@@ -35,7 +35,9 @@ SKIP_LETSENCRYPT="${SKIP_LETSENCRYPT:-0}"      # 1 = nur Self-Signed-Zertifikat
 TIMEZONE="${TIMEZONE:-Europe/Berlin}"
 
 DATA_DIR="$INSTALL_DIR/data"
-SSL_DIR="$DATA_DIR/ssl"
+# Zertifikate bewusst NICHT auf dem Daten-Share: der erste Install-Lauf legt
+# data/ssl oft als Container-root an, und auf NFS darf uid 1500 dort nicht schreiben.
+SSL_DIR="${SSL_DIR:-$INSTALL_DIR/ssl}"
 CONF_FILE="$DATA_DIR/conf.ini"
 BIN="$INSTALL_DIR/cloudreve"
 DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/cloudreve.sh"
@@ -186,8 +188,13 @@ step_user_dirs() {
     die "Datenverzeichnis nicht beschreibbar."
   fi
 
-  as_svc mkdir -p "$SSL_DIR"
-  as_svc chmod 700 "$SSL_DIR" 2>/dev/null || true
+  mkdir -p "$SSL_DIR"
+  chown "$SERVICE_USER:$SERVICE_USER" "$SSL_DIR"
+  chmod 700 "$SSL_DIR"
+  # shellcheck disable=SC2016
+  if ! as_svc sh -c 'f="$1/.rw-test.$$"; : > "$f" && rm -f "$f"' sh "$SSL_DIR"; then
+    die "$SERVICE_USER kann nicht in $SSL_DIR schreiben."
+  fi
 }
 
 step_binary() {
@@ -261,9 +268,22 @@ step_redis() {
   systemctl enable --now redis-server >/dev/null
 }
 
+patch_ssl_paths() {
+  svc_file_exists "$CONF_FILE" || return 0
+  local current
+  current=$(as_svc cat "$CONF_FILE")
+  grep -q "CertPath = $SSL_DIR/fullchain.pem" <<<"$current" && return 0
+  log "SSL-Pfade in $CONF_FILE auf $SSL_DIR setzen ..."
+  printf '%s\n' "$current" | sed \
+    -e "s|^CertPath *=.*|CertPath = $SSL_DIR/fullchain.pem|" \
+    -e "s|^KeyPath *=.*|KeyPath = $SSL_DIR/privkey.pem|" \
+    | write_as_svc "$CONF_FILE"
+}
+
 step_config() {
   if svc_file_exists "$CONF_FILE"; then
     log "Bestehende Konfiguration $CONF_FILE wird beibehalten."
+    patch_ssl_paths
     return
   fi
   log "Konfiguration $CONF_FILE schreiben ..."
