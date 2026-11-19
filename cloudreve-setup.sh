@@ -25,6 +25,7 @@ PUBLIC_IP="${PUBLIC_IP:-}"                     # optional, nur fuer DNS-Check (o
 CLOUDREVE_VERSION="${CLOUDREVE_VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/cloudreve}"
 SERVICE_USER="${SERVICE_USER:-cloudreve}"
+SERVICE_UID="${SERVICE_UID:-1500}"             # feste UID, damit Bind-Mounts/Shares vom Host aus passend berechtigt werden koennen
 USE_POSTGRES="${USE_POSTGRES:-1}"              # 1 = PostgreSQL (empfohlen), 0 = SQLite
 USE_REDIS="${USE_REDIS:-1}"                    # 1 = lokaler Redis als Cache
 HTTP_REDIRECT="${HTTP_REDIRECT:-1}"            # 1 = Port 80 -> 301 https:// (minimaler nginx, KEIN Proxy)
@@ -42,6 +43,8 @@ ISSUE_HELPER="/usr/local/sbin/cloudreve-issue-cert"
 ACME_WEBROOT="/var/www/letsencrypt"
 
 export DEBIAN_FRONTEND=noninteractive
+# LXC-Templates setzen oft LANG=en_US.UTF-8, ohne die Locale zu generieren -> Perl/apt-Warnungen
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 
 # ----------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -91,6 +94,15 @@ installed_version() {
 
 rand_secret() { openssl rand -hex 24; }
 
+# Alles unterhalb von $DATA_DIR wird als $SERVICE_USER gelesen/geschrieben, nie als
+# root + chown. Grund: $DATA_DIR ist oft ein Bind-Mount auf ein Netzwerk-Share
+# (CIFS/NFS), und dort darf root eines unprivilegierten Containers kein chown.
+as_svc() { runuser -u "$SERVICE_USER" -- "$@"; }
+# stdin -> Datei $1 als Service-User, Modus 0600
+# shellcheck disable=SC2016
+write_as_svc() { as_svc sh -c 'umask 077; cat > "$1"' sh "$1"; }
+svc_file_exists() { as_svc test -f "$1"; }
+
 # ----------------------------------------------------------------------------
 # Schritte
 # ----------------------------------------------------------------------------
@@ -133,14 +145,49 @@ EOF
 
 step_user_dirs() {
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-    log "Systembenutzer $SERVICE_USER anlegen ..."
-    useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+    log "Systembenutzer $SERVICE_USER (uid $SERVICE_UID) anlegen ..."
+    local -a uid_args=()
+    if ! getent passwd "$SERVICE_UID" >/dev/null; then
+      uid_args=(--uid "$SERVICE_UID")
+    else
+      warn "UID $SERVICE_UID ist bereits vergeben, $SERVICE_USER bekommt eine freie UID."
+    fi
+    getent group "$SERVICE_USER" >/dev/null || groupadd --gid "$SERVICE_UID" "$SERVICE_USER"
+    useradd "${uid_args[@]}" --gid "$SERVICE_USER" --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+  elif [[ "$(id -u "$SERVICE_USER")" != "$SERVICE_UID" ]]; then
+    if getent passwd "$SERVICE_UID" >/dev/null; then
+      die "UID $SERVICE_UID ist vergeben, $SERVICE_USER hat aber $(id -u "$SERVICE_USER"). SERVICE_UID anders setzen."
+    fi
+    log "$SERVICE_USER von uid $(id -u "$SERVICE_USER") auf $SERVICE_UID umstellen ..."
+    getent group "$SERVICE_USER" >/dev/null || groupadd --gid "$SERVICE_UID" "$SERVICE_USER"
+    groupmod -g "$SERVICE_UID" "$SERVICE_USER" 2>/dev/null || true
+    usermod -u "$SERVICE_UID" -g "$SERVICE_USER" "$SERVICE_USER"
   fi
-  mkdir -p "$DATA_DIR" "$SSL_DIR"
-  # bewusst nicht rekursiv: data/ kann bei Updates sehr gross sein
-  chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" "$DATA_DIR" "$SSL_DIR"
-  chmod 750 "$INSTALL_DIR" "$DATA_DIR"
-  chmod 700 "$SSL_DIR"
+  SERVICE_UID=$(id -u "$SERVICE_USER")
+
+  mkdir -p "$INSTALL_DIR" "$DATA_DIR"
+  chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+  chmod 750 "$INSTALL_DIR"
+
+  # $DATA_DIR kann ein Bind-Mount sein (Netzwerk-Share): chown/chmod duerfen dort
+  # scheitern, entscheidend ist, dass der Service-User schreiben kann.
+  chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" 2>/dev/null || true
+  chmod 750 "$DATA_DIR" 2>/dev/null || true
+  # shellcheck disable=SC2016
+  if ! as_svc sh -c 'f="$1/.rw-test.$$" && : > "$f" && rm -f "$f"' sh "$DATA_DIR"; then
+    local owner
+    owner=$(stat -c '%u:%g (%A)' "$DATA_DIR" 2>/dev/null || echo "?")
+    warn "$SERVICE_USER (uid $SERVICE_UID) kann nicht in $DATA_DIR schreiben. Owner/Modus: $owner"
+    if mountpoint -q "$DATA_DIR"; then
+      warn "$DATA_DIR ist ein Mount vom Host. Das Host-Verzeichnis muss uid $((100000 + SERVICE_UID)) gehoeren"
+      warn "(unprivilegierter Container: 100000 + $SERVICE_UID). Bei CIFS: Mount-Option uid=$((100000 + SERVICE_UID)),gid=$((100000 + SERVICE_UID));"
+      warn "bei NFS: Verzeichnis auf dem Server entsprechend chown'en."
+    fi
+    die "Datenverzeichnis nicht beschreibbar."
+  fi
+
+  as_svc mkdir -p "$SSL_DIR"
+  as_svc chmod 700 "$SSL_DIR" 2>/dev/null || true
 }
 
 step_binary() {
@@ -184,9 +231,9 @@ step_postgres() {
 
   if su - postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='cloudreve'\"" | grep -q 1; then
     log "DB-Rolle cloudreve existiert bereits."
-    if [[ -f "$CONF_FILE" ]]; then
+    if svc_file_exists "$CONF_FILE"; then
       # shellcheck disable=SC2016
-      DB_PASSWORD=$(sed -n 's/^Password *= *`\?\([^`]*\)`\?.*/\1/p' "$CONF_FILE" | head -n1)
+      DB_PASSWORD=$(as_svc cat "$CONF_FILE" | sed -n 's/^Password *= *`\?\([^`]*\)`\?.*/\1/p' | head -n1)
     fi
     if [[ -z "$DB_PASSWORD" ]]; then
       DB_PASSWORD=$(rand_secret)
@@ -215,7 +262,7 @@ step_redis() {
 }
 
 step_config() {
-  if [[ -f "$CONF_FILE" ]]; then
+  if svc_file_exists "$CONF_FILE"; then
     log "Bestehende Konfiguration $CONF_FILE wird beibehalten."
     return
   fi
@@ -261,9 +308,7 @@ Server = 127.0.0.1:6379
 DB = 0
 EOF
     fi
-  } > "$CONF_FILE"
-  chown "$SERVICE_USER:$SERVICE_USER" "$CONF_FILE"
-  chmod 600 "$CONF_FILE"
+  } | write_as_svc "$CONF_FILE"
 }
 
 step_http_redirect() {
@@ -305,8 +350,10 @@ write_deploy_hook() {
 set -euo pipefail
 LIVE="/etc/letsencrypt/live/$DOMAIN"
 DEST="$SSL_DIR"
-install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 "\$LIVE/fullchain.pem" "\$DEST/fullchain.pem"
-install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0600 "\$LIVE/privkey.pem"   "\$DEST/privkey.pem"
+# root liest, $SERVICE_USER schreibt - funktioniert auch auf Shares ohne chown-Recht
+copy() { runuser -u "$SERVICE_USER" -- sh -c 'umask 077; cat > "\$1"' sh "\$2" < "\$1"; }
+copy "\$LIVE/fullchain.pem" "\$DEST/fullchain.pem"
+copy "\$LIVE/privkey.pem"   "\$DEST/privkey.pem"
 systemctl try-restart cloudreve.service || true
 EOF
   chmod 755 "$DEPLOY_HOOK"
@@ -331,18 +378,21 @@ certbot certonly --non-interactive --agree-tos --keep-until-expiring \\
   --key-type ecdsa
 "$DEPLOY_HOOK"
 echo "Zertifikat installiert. Ablaufdatum:"
-openssl x509 -in "$SSL_DIR/fullchain.pem" -noout -enddate
+runuser -u "$SERVICE_USER" -- cat "$SSL_DIR/fullchain.pem" | openssl x509 -noout -enddate
 EOF
   chmod 755 "$ISSUE_HELPER"
 }
 
 make_self_signed() {
   warn "Erzeuge temporaeres Self-Signed-Zertifikat, damit Cloudreve starten kann."
+  local tmp
+  tmp=$(mktemp -d)
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -days 30 -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" \
-    -keyout "$SSL_DIR/privkey.pem" -out "$SSL_DIR/fullchain.pem" >/dev/null 2>&1
-  chown "$SERVICE_USER:$SERVICE_USER" "$SSL_DIR"/*.pem
-  chmod 600 "$SSL_DIR"/*.pem
+    -keyout "$tmp/privkey.pem" -out "$tmp/fullchain.pem" >/dev/null 2>&1
+  write_as_svc "$SSL_DIR/privkey.pem"   < "$tmp/privkey.pem"
+  write_as_svc "$SSL_DIR/fullchain.pem" < "$tmp/fullchain.pem"
+  rm -rf "$tmp"
 }
 
 dns_check() {
@@ -368,7 +418,7 @@ step_certificate() {
   write_deploy_hook
 
   if [[ "$SKIP_LETSENCRYPT" == "1" ]]; then
-    [[ -f "$SSL_DIR/fullchain.pem" ]] || make_self_signed
+    svc_file_exists "$SSL_DIR/fullchain.pem" || make_self_signed
     return
   fi
 
@@ -391,7 +441,7 @@ step_certificate() {
   else
     warn "Let's Encrypt fehlgeschlagen (meist: DNS zeigt noch nicht hierher oder Port 80 ist von aussen nicht erreichbar)."
     warn "Spaeter einfach erneut ausfuehren: $ISSUE_HELPER"
-    [[ -f "$SSL_DIR/fullchain.pem" ]] || make_self_signed
+    svc_file_exists "$SSL_DIR/fullchain.pem" || make_self_signed
   fi
 }
 

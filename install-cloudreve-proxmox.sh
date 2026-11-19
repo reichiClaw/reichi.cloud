@@ -68,6 +68,8 @@ DATA_DISK_GB="${DATA_DISK_GB:-0}"        # >0 = separates Volume fuer /opt/cloud
 DATA_HOST_DIR="${DATA_HOST_DIR:-}"       # Host-Verzeichnis, das als /opt/cloudreve/data in den Container gemountet wird
                                          # (z.B. /mnt/pve/CloudStorage/cloudreve); schliesst DATA_DISK_GB aus
 CT_DATA_DIR="/opt/cloudreve/data"
+SERVICE_UID="${SERVICE_UID:-1500}"       # UID des cloudreve-Users im Container (Host-seitig: 100000 + UID bei unprivilegiert)
+RESUME=0                                 # 1 = bestehender Container, Setup wird nur erneut ausgefuehrt
 MEMORY_MB="${MEMORY_MB:-2048}"
 SWAP_MB="${SWAP_MB:-512}"
 CORES="${CORES:-2}"
@@ -240,12 +242,22 @@ preflight() {
   pvesm status --storage "$STORAGE" >/dev/null 2>&1 || die "Storage $STORAGE nicht gefunden."
   pvesm status --storage "$TEMPLATE_STORAGE" >/dev/null 2>&1 || die "Template-Storage $TEMPLATE_STORAGE nicht gefunden."
 
+  local existing=""
+  existing=$(pct list 2>/dev/null | awk -v h="$CT_HOSTNAME" 'NR>1 && $NF==h {print $1; exit}') || true
   if [[ -z "$CTID" ]]; then
-    CTID=$(pvesh get /cluster/nextid)
+    if [[ -n "$existing" ]]; then
+      CTID="$existing"
+      RESUME=1
+    else
+      CTID=$(pvesh get /cluster/nextid)
+    fi
   fi
   [[ "$CTID" =~ ^[0-9]+$ ]] || die "CTID muss numerisch sein: $CTID"
   if pct status "$CTID" >/dev/null 2>&1; then
-    die "CTID $CTID ist bereits belegt. Anderen Wert mit CTID=... angeben."
+    RESUME=1
+    log "Container #$CTID existiert bereits - Installation wird fortgesetzt (kein Neu-Anlegen)."
+  elif [[ -n "$existing" && "$existing" != "$CTID" ]]; then
+    die "Hostname $CT_HOSTNAME ist bereits Container #$existing. CTID=$existing setzen oder den alten Container entfernen."
   fi
 
   log "Container #$CTID ($CT_HOSTNAME) -> $CT_IP via $GATEWAY auf $BRIDGE, Domain $DOMAIN"
@@ -285,21 +297,111 @@ ensure_template() {
   TEMPLATE_VOLID="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}"
 }
 
+# UID, unter der der cloudreve-User des Containers auf dem Host erscheint
+host_svc_uid() {
+  if [[ "$UNPRIVILEGED" == "1" ]]; then echo $((100000 + SERVICE_UID)); else echo "$SERVICE_UID"; fi
+}
+
+# Bestehende pvesm --options behalten und uid/gid fuer den Container-User setzen.
+merge_cifs_uid() {
+  local storage=$1 want=$2
+  local current merged
+  current=$(pvesm config "$storage" 2>/dev/null | awk '
+    /^[[:space:]]*options:[[:space:]]*/ {
+      sub(/^[[:space:]]*options:[[:space:]]*/, ""); print; exit
+    }
+    /^[[:space:]]*options[[:space:]]+/ {
+      sub(/^[[:space:]]*options[[:space:]]+/, ""); print; exit
+    }') || current=""
+  # grep -v kann Exit 1 liefern, wenn alle Zeilen rausgefiltert werden (pipefail)
+  merged=$(
+    set +o pipefail
+    printf '%s\n' "$current" | tr ',' '\n' \
+      | grep -Ev '^(uid|gid|file_mode|dir_mode|forceuid|forcegid)=' \
+      | grep -Ev '^(forceuid|forcegid)$' \
+      | grep -v '^$' \
+      | paste -sd, -
+  )
+  merged="${merged:+$merged,}uid=${want},gid=${want},file_mode=0660,dir_mode=0770,forceuid,forcegid"
+  log "CIFS-Storage $storage: Mount-Optionen auf uid=$want setzen ..."
+  pvesm set "$storage" --options "$merged"
+}
+
+remount_pve_storage() {
+  local storage=$1 mp="/mnt/pve/$1"
+  log "Storage $storage neu einhaengen ..."
+  if mountpoint -q "$mp"; then
+    umount "$mp" || umount -l "$mp" || die "umount $mp fehlgeschlagen (wird der Pfad gerade benutzt?)."
+  fi
+  local i
+  for i in $(seq 1 30); do
+    pvesm status --storage "$storage" >/dev/null 2>&1 || true
+    if mountpoint -q "$mp"; then
+      log "$mp ist nach ${i}s wieder gemountet."
+      return 0
+    fi
+    sleep 1
+  done
+  die "$mp wurde nach dem umount nicht automatisch neu gemountet. Mit 'pvesm status' pruefen."
+}
+
+host_can_write_as() {
+  local dir=$1 uid=$2
+  if command -v setpriv >/dev/null 2>&1; then
+    # shellcheck disable=SC2016
+    setpriv --reuid="$uid" --regid="$uid" --clear-groups -- \
+      sh -c 'f="$1/.host-rw.$$"; : > "$f" && rm -f "$f"' sh "$dir"
+  else
+    return 0
+  fi
+}
+
 prepare_data_dir() {
   [[ -n "$DATA_HOST_DIR" ]] || return 0
-  log "Host-Verzeichnis $DATA_HOST_DIR vorbereiten ..."
+  local want fstype opts storage
+  want=$(host_svc_uid)
+  log "Host-Verzeichnis $DATA_HOST_DIR vorbereiten (Owner soll uid $want sein) ..."
   mkdir -p "$DATA_HOST_DIR"
-  if [[ "$UNPRIVILEGED" == "1" ]]; then
-    # Unprivilegierte Container mappen uid 0 -> 100000 auf dem Host. Damit root im
-    # Container das Verzeichnis an den cloudreve-User uebergeben kann, muss es ihm
-    # gehoeren. Nur das Verzeichnis selbst, nicht rekursiv (kann sehr gross sein).
-    local owner
-    owner=$(stat -c %u "$DATA_HOST_DIR")
-    if (( owner < 100000 )); then
-      chown 100000:100000 "$DATA_HOST_DIR" \
-        || warn "chown auf $DATA_HOST_DIR fehlgeschlagen (CIFS/NFS ohne uid-Mapping?). Im Container dann ggf. Rechte manuell pruefen."
-    fi
+
+  fstype=$(findmnt -n -o FSTYPE -T "$DATA_HOST_DIR" 2>/dev/null || echo "?")
+  opts=$(findmnt -n -o OPTIONS -T "$DATA_HOST_DIR" 2>/dev/null || true)
+  storage=""
+  [[ "$DATA_HOST_DIR" == /mnt/pve/* ]] && { storage="${DATA_HOST_DIR#/mnt/pve/}"; storage="${storage%%/*}"; }
+
+  case "$fstype" in
+    cifs|smb3)
+      # CIFS kennt kein chown; Owner kommt aus der Mount-Option uid=/gid=.
+      if [[ ",$opts," != *",uid=${want},"* ]]; then
+        [[ -n "$storage" ]] || die "CIFS-Mount ohne uid=$want und kein PVE-Storage-Name ableitbar. Mount-Option uid=$want,gid=$want setzen."
+        merge_cifs_uid "$storage" "$want"
+        remount_pve_storage "$storage"
+        mkdir -p "$DATA_HOST_DIR"
+        opts=$(findmnt -n -o OPTIONS -T "$DATA_HOST_DIR" 2>/dev/null || true)
+        [[ ",$opts," == *",uid=${want},"* ]] || die "CIFS-Share hat nach dem Remount immer noch nicht uid=$want (Optionen: $opts)."
+      fi
+      ;;
+    nfs|nfs4)
+      # chown geht nur, wenn der Export root nicht squasht (no_root_squash).
+      if [[ "$(stat -c %u "$DATA_HOST_DIR")" != "$want" ]]; then
+        chown "$want:$want" "$DATA_HOST_DIR" 2>/dev/null || {
+          warn "chown auf dem NFS-Share $DATA_HOST_DIR nicht moeglich (root_squash?)."
+          warn "Auf dem NFS-Server ausfuehren: chown $want:$want <Export-Pfad>/${DATA_HOST_DIR#/mnt/pve/*/}"
+          die "NFS-Berechtigungen anpassen und Script erneut starten."
+        }
+      fi
+      ;;
+    *)
+      # lokales Dateisystem (ext4/zfs/xfs/...): chown reicht. Nicht rekursiv, data/ kann gross sein.
+      if [[ "$(stat -c %u "$DATA_HOST_DIR")" != "$want" ]]; then
+        chown "$want:$want" "$DATA_HOST_DIR" || die "chown $want:$want $DATA_HOST_DIR fehlgeschlagen (Dateisystem $fstype)."
+      fi
+      ;;
+  esac
+  chmod 750 "$DATA_HOST_DIR" 2>/dev/null || true
+  if ! host_can_write_as "$DATA_HOST_DIR" "$want"; then
+    die "uid $want kann nicht in $DATA_HOST_DIR schreiben (Dateisystem $fstype, Owner $(stat -c %u:%g "$DATA_HOST_DIR"))."
   fi
+  log "Dateisystem: $fstype, Owner: $(stat -c %u:%g "$DATA_HOST_DIR")"
 }
 
 create_container() {
@@ -450,8 +552,10 @@ run_setup() {
 
   log "Cloudreve im Container installieren (dauert einige Minuten) ..."
   ct_exec env \
+    LC_ALL=C.UTF-8 LANG=C.UTF-8 \
     DOMAIN="$DOMAIN" \
     LE_EMAIL="$LE_EMAIL" \
+    SERVICE_UID="$SERVICE_UID" \
     PUBLIC_IP="${PUBLIC_IP:-${CT_IP%%/*}}" \
     CLOUDREVE_VERSION="$CLOUDREVE_VERSION" \
     USE_POSTGRES="$USE_POSTGRES" \
@@ -486,12 +590,25 @@ print_summary() {
 EOF
 }
 
+stop_for_remount() {
+  [[ "$RESUME" == "1" ]] || return 0
+  if pct status "$CTID" 2>/dev/null | grep -qi running; then
+    log "Container #$CTID kurz stoppen, damit das Daten-Storage neu gemountet werden kann ..."
+    pct shutdown "$CTID" --timeout 20 >/dev/null 2>&1 || pct stop "$CTID"
+  fi
+}
+
 main() {
   preflight
   locate_setup_script
-  ensure_template
+  if [[ "$RESUME" == "1" ]]; then
+    TEMPLATE="${TEMPLATE:-bestehend}"
+  else
+    ensure_template
+  fi
+  stop_for_remount
   prepare_data_dir
-  create_container
+  [[ "$RESUME" == "1" ]] || create_container
   setup_nat
   start_container
   set_root_password

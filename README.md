@@ -88,13 +88,17 @@ bash install-cloudreve-proxmox.sh
 Das Script
 
 1. lädt das aktuelle `debian-12-standard`-Template (falls nicht vorhanden),
-2. bereitet ggf. das Host-Datenverzeichnis vor (Owner `100000` = root im unprivilegierten Container),
+2. bereitet ggf. das Host-Datenverzeichnis vor (Owner = `100000 + SERVICE_UID`, also `101500`; bei CIFS setzt
+   das Script die Mount-Option `uid=` selbst und hängt das Storage neu ein),
 3. legt einen unprivilegierten Container an (Default: 2 Cores, 2 GB RAM, 16 GB Disk) inkl. Bind-Mount
    nach `/opt/cloudreve/data`,
 4. setzt die statische IP, DNS, Autostart und einen Proxmox-Firewall-Regelsatz (22/80/443),
 5. richtet bei Variante B das Port-Forwarding am Host ein,
 6. startet den Container, setzt ein zufälliges root-Passwort (wird am Ende angezeigt),
 7. kopiert `cloudreve-setup.sh` in den Container und führt es aus.
+
+Ein erneuter Aufruf mit demselben `CT_HOSTNAME` (Default `cloudreve`) setzt eine abgebrochene Installation
+fort, statt einen zweiten Container anzulegen.
 
 Am Ende erscheint eine Zusammenfassung mit URL, Container-ID und root-Passwort.
 
@@ -137,6 +141,7 @@ Alle Werte werden als Umgebungsvariablen übergeben.
 | `DATA_HOST_DIR` | leer | Host-Verzeichnis, das als `/opt/cloudreve/data` in den Container gemountet wird (z. B. `/mnt/pve/CloudStorage/cloudreve`); schließt `DATA_DISK_GB` aus |
 | `MEMORY_MB` / `SWAP_MB` / `CORES` | `2048` / `512` / `2` | Ressourcen |
 | `UNPRIVILEGED` | `1` | Unprivilegierter Container |
+| `SERVICE_UID` | `1500` | UID des Cloudreve-Users im Container (Host-seitig `100000 + UID`) |
 | `START_ONBOOT` | `1` | Autostart |
 | `PVE_FIREWALL` | `1` | `/etc/pve/firewall/<CTID>.fw` mit 22/80/443 anlegen (wirkt nur bei aktiver Datacenter-Firewall) |
 
@@ -157,6 +162,7 @@ Die folgenden Variablen werden unverändert an `cloudreve-setup.sh` weitergereic
 | `SKIP_LETSENCRYPT` | `0` | `1` = nur Self-Signed-Zertifikat |
 | `TIMEZONE` | `Europe/Berlin` | Zeitzone im Container |
 | `INSTALL_DIR` | `/opt/cloudreve` | Installationsverzeichnis |
+| `SERVICE_UID` | `1500` | UID des Service-Users `cloudreve` |
 
 Das Container-Script kann auch allein auf einer beliebigen Debian/Ubuntu-VM laufen:
 
@@ -215,8 +221,13 @@ Ausführen erhalten, nur das Binary wird auf die gewünschte Version gebracht.
   Zugriff auf `https://reichi.cloud` **aus dem Container-Netz selbst** (Hairpin-NAT) ist nicht eingerichtet.
 - **`DATA_HOST_DIR` auf einem PVE-Storage**: Ein Unterverzeichnis verwenden (z. B.
   `/mnt/pve/CloudStorage/cloudreve`), damit Cloudreve nicht neben den PVE-Ordnern (`dump/`, `images/`, …)
-  liegt. Das Script setzt den Owner des Verzeichnisses auf `100000` (uid 0 im unprivilegierten Container);
-  bei CIFS/NFS ohne uid-Mapping ggf. `uid=100000,gid=100000` als Mount-Option setzen.
+  liegt. Der Cloudreve-User hat im Container die feste UID `1500` (`SERVICE_UID`), auf dem Host also `101500`.
+  Alles unter `data/` wird im Container als dieser User geschrieben (nie root + `chown`), damit es auch auf
+  Netzwerk-Shares funktioniert:
+  - **lokales Dateisystem**: das Script `chown`t das Verzeichnis auf `101500`.
+  - **CIFS/SMB**: kein `chown` möglich. Das Script setzt `uid=101500,gid=101500` in den bestehenden
+    `pvesm --options` (bestehende Optionen bleiben erhalten) und hängt das Storage neu ein.
+  - **NFS**: `chown` klappt nur mit `no_root_squash`; sonst das Verzeichnis auf dem NFS-Server auf `101500` setzen.
 - Große Uploads: Ohne Reverse Proxy gibt es kein `client_max_body_size`-Limit; Chunk-Größen werden
   in der Cloudreve-Speicherrichtlinie konfiguriert.
 - Backups: Container per Proxmox-Backup sichern. Ein Bind-Mount (`DATA_HOST_DIR`) wird von `vzdump`
