@@ -2,13 +2,19 @@
 # =============================================================================
 # install-cloudreve-proxmox.sh
 #
-# Legt auf einem Proxmox-VE-Host einen Debian-LXC-Container mit fester
-# oeffentlicher IP an und installiert darin Cloudreve (v4) mit eigenem
-# TLS-Endpunkt (Let's Encrypt) - ohne Reverse Proxy.
+# Legt auf einem Proxmox-VE-Host einen Debian-LXC-Container mit fester IP an
+# und installiert darin Cloudreve (v4) mit eigenem TLS-Endpunkt
+# (Let's Encrypt) - ohne Reverse Proxy.
 #
 # Aufruf auf dem Proxmox-Host als root, z.B.:
 #
-#   PUBLIC_IP=203.0.113.10/24 GATEWAY=203.0.113.1 LE_EMAIL=admin@reichi.cloud \
+#   # Container an privater Bridge, oeffentliche IP am Host (DNAT 80/443):
+#   CT_IP=10.2.0.5 BRIDGE=vmbr1 PUBLIC_IP=91.112.42.60 \
+#   DATA_HOST_DIR=/mnt/pve/CloudStorage/cloudreve LE_EMAIL=admin@reichi.cloud \
+#     bash install-cloudreve-proxmox.sh
+#
+#   # Container hat die oeffentliche IP selbst:
+#   CT_IP=203.0.113.10/24 GATEWAY=203.0.113.1 LE_EMAIL=admin@reichi.cloud \
 #     bash install-cloudreve-proxmox.sh
 #
 # Alle Werte lassen sich per Umgebungsvariable anpassen (siehe unten).
@@ -22,9 +28,20 @@ set -Eeuo pipefail
 # ----------------------------------------------------------------------------
 DOMAIN="${DOMAIN:-reichi.cloud}"
 LE_EMAIL="${LE_EMAIL:-}"                 # Pflicht: E-Mail fuer Let's Encrypt
-PUBLIC_IP="${PUBLIC_IP:-}"               # Pflicht: feste oeffentliche IPv4 mit CIDR, z.B. 203.0.113.10/24
-GATEWAY="${GATEWAY:-}"                   # Pflicht: IPv4-Gateway
-PUBLIC_IP6="${PUBLIC_IP6:-}"             # optional: IPv6 mit CIDR, z.B. 2001:db8::10/64
+
+# --- Netzwerk ----------------------------------------------------------------
+# Zwei Betriebsarten:
+#  a) Container hat die oeffentliche IP selbst:  CT_IP=203.0.113.10/24 GATEWAY=203.0.113.1
+#  b) Container haengt an einer privaten Bridge, die oeffentliche IP liegt am Host:
+#     CT_IP=10.2.0.5 BRIDGE=vmbr1 PUBLIC_IP=91.112.42.60
+#     -> Script richtet DNAT (80/443) vom Host auf den Container ein.
+CT_IP="${CT_IP:-}"                       # Pflicht: IPv4 des Containers, mit oder ohne CIDR
+GATEWAY="${GATEWAY:-}"                   # IPv4-Gateway; leer = IP des Hosts auf $BRIDGE
+PUBLIC_IP="${PUBLIC_IP:-}"               # oeffentliche IPv4 (ohne CIDR), unter der $DOMAIN erreichbar ist
+NAT_FORWARD="${NAT_FORWARD:-auto}"       # auto = an, wenn PUBLIC_IP gesetzt und != CT_IP
+NAT_PORTS="${NAT_PORTS:-80 443}"         # Ports, die vom Host auf den Container weitergeleitet werden
+WAN_IFACE="${WAN_IFACE:-}"               # Host-Interface mit der oeffentlichen IP; leer = Default-Route
+PUBLIC_IP6="${PUBLIC_IP6:-}"             # optional: IPv6 des Containers mit CIDR, z.B. 2001:db8::10/64
 GATEWAY6="${GATEWAY6:-}"                 # optional: IPv6-Gateway
 CT_MAC="${CT_MAC:-}"                     # optional: feste MAC (manche Hoster verlangen das fuer Zusatz-IPs)
 BRIDGE="${BRIDGE:-vmbr0}"
@@ -39,6 +56,9 @@ TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
 TEMPLATE_PATTERN="${TEMPLATE_PATTERN:-debian-12-standard}"
 DISK_GB="${DISK_GB:-16}"                 # Groesse rootfs
 DATA_DISK_GB="${DATA_DISK_GB:-0}"        # >0 = separates Volume fuer /opt/cloudreve/data (Uploads)
+DATA_HOST_DIR="${DATA_HOST_DIR:-}"       # Host-Verzeichnis, das als /opt/cloudreve/data in den Container gemountet wird
+                                         # (z.B. /mnt/pve/CloudStorage/cloudreve); schliesst DATA_DISK_GB aus
+CT_DATA_DIR="/opt/cloudreve/data"
 MEMORY_MB="${MEMORY_MB:-2048}"
 SWAP_MB="${SWAP_MB:-512}"
 CORES="${CORES:-2}"
@@ -72,16 +92,67 @@ valid_ipv4()      { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
 ct_exec() { pct exec "$CTID" -- "$@"; }
 
+# Erste IPv4 (mit CIDR) des Hosts auf der Bridge, z.B. 10.2.0.1/24
+bridge_addr() { { ip -4 -o addr show dev "$BRIDGE" 2>/dev/null || true; } | awk '{print $4; exit}'; }
+
+resolve_network() {
+  # Abwaertskompatibel: frueher wurde die Container-IP als PUBLIC_IP=<ip>/<cidr> uebergeben.
+  if [[ -z "$CT_IP" && "$PUBLIC_IP" == */* ]]; then
+    CT_IP="$PUBLIC_IP"; PUBLIC_IP="${PUBLIC_IP%%/*}"
+  fi
+  [[ -n "$CT_IP" ]] || die "CT_IP fehlt (z.B. CT_IP=10.2.0.5 oder CT_IP=203.0.113.10/24)."
+
+  local br_addr
+  br_addr=$(bridge_addr)
+
+  if [[ "$CT_IP" != */* ]]; then
+    valid_ipv4 "$CT_IP" || die "CT_IP ist keine gueltige IPv4-Adresse: $CT_IP"
+    if [[ -n "$br_addr" ]]; then
+      CT_IP="$CT_IP/${br_addr##*/}"
+    else
+      warn "Keine IPv4 auf $BRIDGE gefunden, nehme /24 fuer $CT_IP an."
+      CT_IP="$CT_IP/24"
+    fi
+  fi
+  valid_ipv4_cidr "$CT_IP" || die "CT_IP muss IPv4 (optional mit CIDR) sein, aktuell: $CT_IP"
+
+  if [[ -z "$GATEWAY" ]]; then
+    [[ -n "$br_addr" ]] || die "GATEWAY fehlt und $BRIDGE hat keine IPv4-Adresse, aus der es abgeleitet werden kann."
+    GATEWAY="${br_addr%%/*}"
+    log "GATEWAY nicht angegeben, verwende Host-IP auf $BRIDGE: $GATEWAY"
+  fi
+  valid_ipv4 "$GATEWAY" || die "GATEWAY ist keine gueltige IPv4-Adresse: $GATEWAY"
+
+  if [[ -n "$PUBLIC_IP" ]]; then
+    valid_ipv4 "$PUBLIC_IP" || die "PUBLIC_IP muss eine IPv4 ohne CIDR sein: $PUBLIC_IP"
+  fi
+
+  if [[ "$NAT_FORWARD" == "auto" ]]; then
+    if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "${CT_IP%%/*}" ]]; then NAT_FORWARD=1; else NAT_FORWARD=0; fi
+  fi
+
+  if [[ "$NAT_FORWARD" == "1" ]]; then
+    [[ -n "$PUBLIC_IP" ]] || die "NAT_FORWARD=1 benoetigt PUBLIC_IP."
+    command -v iptables >/dev/null 2>&1 || die "iptables nicht gefunden (fuer NAT_FORWARD benoetigt)."
+    if [[ -z "$WAN_IFACE" ]]; then
+      WAN_IFACE=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    fi
+    [[ -n "$WAN_IFACE" ]] || die "WAN_IFACE konnte nicht ermittelt werden (keine Default-Route?). Bitte WAN_IFACE=... setzen."
+    if ! ip -4 -o addr show | grep -q " ${PUBLIC_IP}/"; then
+      warn "PUBLIC_IP $PUBLIC_IP ist auf diesem Host auf keinem Interface konfiguriert - DNAT greift nur, wenn der Traffic hier ankommt."
+    fi
+  fi
+}
+
 preflight() {
   [[ $EUID -eq 0 ]] || die "Bitte als root auf dem Proxmox-Host ausfuehren."
   for cmd in pct pveam pvesh pvesm; do
     command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' nicht gefunden - ist das ein Proxmox-VE-Host?"
   done
 
-  [[ -n "$PUBLIC_IP" ]] || die "PUBLIC_IP fehlt (z.B. PUBLIC_IP=203.0.113.10/24)."
-  valid_ipv4_cidr "$PUBLIC_IP" || die "PUBLIC_IP muss IPv4 mit CIDR sein, z.B. 203.0.113.10/24 (aktuell: $PUBLIC_IP)."
-  [[ -n "$GATEWAY" ]] || die "GATEWAY fehlt (z.B. GATEWAY=203.0.113.1)."
-  valid_ipv4 "$GATEWAY" || die "GATEWAY ist keine gueltige IPv4-Adresse: $GATEWAY"
+  ip link show "$BRIDGE" >/dev/null 2>&1 || die "Bridge $BRIDGE existiert nicht auf diesem Host."
+  resolve_network
+
   if [[ -n "$PUBLIC_IP6" && -z "$GATEWAY6" ]]; then
     die "PUBLIC_IP6 gesetzt, aber GATEWAY6 fehlt."
   fi
@@ -91,8 +162,16 @@ preflight() {
   if [[ -n "$SSH_PUBKEY_FILE" && ! -r "$SSH_PUBKEY_FILE" ]]; then
     die "SSH_PUBKEY_FILE nicht lesbar: $SSH_PUBKEY_FILE"
   fi
+  if [[ -n "$DATA_HOST_DIR" ]]; then
+    [[ "$DATA_HOST_DIR" == /* ]] || die "DATA_HOST_DIR muss ein absoluter Pfad sein: $DATA_HOST_DIR"
+    [[ "$DATA_DISK_GB" -eq 0 ]] || die "DATA_HOST_DIR und DATA_DISK_GB schliessen sich aus."
+    local parent="$DATA_HOST_DIR"
+    while [[ ! -d "$parent" && "$parent" != "/" ]]; do parent=$(dirname "$parent"); done
+    if ! mountpoint -q "$parent" 2>/dev/null && [[ "$DATA_HOST_DIR" == /mnt/* ]]; then
+      warn "$parent ist kein eigener Mountpoint - sicher, dass das Storage unter $DATA_HOST_DIR gemountet ist?"
+    fi
+  fi
 
-  ip link show "$BRIDGE" >/dev/null 2>&1 || die "Bridge $BRIDGE existiert nicht auf diesem Host."
   pvesm status --storage "$STORAGE" >/dev/null 2>&1 || die "Storage $STORAGE nicht gefunden."
   pvesm status --storage "$TEMPLATE_STORAGE" >/dev/null 2>&1 || die "Template-Storage $TEMPLATE_STORAGE nicht gefunden."
 
@@ -104,7 +183,12 @@ preflight() {
     die "CTID $CTID ist bereits belegt. Anderen Wert mit CTID=... angeben."
   fi
 
-  log "Container #$CTID ($CT_HOSTNAME) -> $PUBLIC_IP via $GATEWAY auf $BRIDGE, Domain $DOMAIN"
+  log "Container #$CTID ($CT_HOSTNAME) -> $CT_IP via $GATEWAY auf $BRIDGE, Domain $DOMAIN"
+  if [[ "$NAT_FORWARD" == "1" ]]; then
+    log "NAT: $PUBLIC_IP ($WAN_IFACE) Ports $NAT_PORTS -> ${CT_IP%%/*}"
+  fi
+  [[ -n "$DATA_HOST_DIR" ]] && log "Daten: $DATA_HOST_DIR -> $CT_DATA_DIR (Bind-Mount)"
+  return 0
 }
 
 locate_setup_script() {
@@ -136,8 +220,25 @@ ensure_template() {
   TEMPLATE_VOLID="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}"
 }
 
+prepare_data_dir() {
+  [[ -n "$DATA_HOST_DIR" ]] || return 0
+  log "Host-Verzeichnis $DATA_HOST_DIR vorbereiten ..."
+  mkdir -p "$DATA_HOST_DIR"
+  if [[ "$UNPRIVILEGED" == "1" ]]; then
+    # Unprivilegierte Container mappen uid 0 -> 100000 auf dem Host. Damit root im
+    # Container das Verzeichnis an den cloudreve-User uebergeben kann, muss es ihm
+    # gehoeren. Nur das Verzeichnis selbst, nicht rekursiv (kann sehr gross sein).
+    local owner
+    owner=$(stat -c %u "$DATA_HOST_DIR")
+    if (( owner < 100000 )); then
+      chown 100000:100000 "$DATA_HOST_DIR" \
+        || warn "chown auf $DATA_HOST_DIR fehlgeschlagen (CIFS/NFS ohne uid-Mapping?). Im Container dann ggf. Rechte manuell pruefen."
+    fi
+  fi
+}
+
 create_container() {
-  local net0="name=eth0,bridge=${BRIDGE},ip=${PUBLIC_IP},gw=${GATEWAY},firewall=1"
+  local net0="name=eth0,bridge=${BRIDGE},ip=${CT_IP},gw=${GATEWAY},firewall=1"
   [[ -n "$PUBLIC_IP6" ]] && net0+=",ip6=${PUBLIC_IP6},gw6=${GATEWAY6}"
   [[ -n "$CT_MAC" ]] && net0+=",hwaddr=${CT_MAC}"
 
@@ -167,9 +268,12 @@ create_container() {
   log "Container anlegen ..."
   pct create "${args[@]}"
 
-  if [[ "$DATA_DISK_GB" -gt 0 ]]; then
-    log "Daten-Volume (${DATA_DISK_GB}G) fuer /opt/cloudreve/data anlegen ..."
-    pct set "$CTID" --mp0 "${STORAGE}:${DATA_DISK_GB},mp=/opt/cloudreve/data,backup=1"
+  if [[ -n "$DATA_HOST_DIR" ]]; then
+    log "Bind-Mount $DATA_HOST_DIR -> $CT_DATA_DIR einrichten ..."
+    pct set "$CTID" --mp0 "${DATA_HOST_DIR},mp=${CT_DATA_DIR}"
+  elif [[ "$DATA_DISK_GB" -gt 0 ]]; then
+    log "Daten-Volume (${DATA_DISK_GB}G) fuer $CT_DATA_DIR anlegen ..."
+    pct set "$CTID" --mp0 "${STORAGE}:${DATA_DISK_GB},mp=${CT_DATA_DIR},backup=1"
   fi
 
   if [[ "$PVE_FIREWALL" == "1" ]]; then
@@ -190,6 +294,61 @@ IN ACCEPT -p icmp -log nolog
 IN ACCEPT -p ipv6-icmp -log nolog
 EOF
   fi
+}
+
+NAT_SCRIPT="/usr/local/sbin/cloudreve-nat"
+setup_nat() {
+  [[ "$NAT_FORWARD" == "1" ]] || return 0
+  local ct_ip="${CT_IP%%/*}"
+  log "Port-Forwarding $PUBLIC_IP -> $ct_ip (TCP $NAT_PORTS) auf dem Host einrichten ..."
+
+  cat > /etc/sysctl.d/99-cloudreve-forward.conf <<'EOF'
+net.ipv4.ip_forward = 1
+EOF
+  sysctl -q -p /etc/sysctl.d/99-cloudreve-forward.conf
+
+  cat > "$NAT_SCRIPT" <<EOF
+#!/usr/bin/env bash
+# Leitet TCP $NAT_PORTS von $PUBLIC_IP ($WAN_IFACE) an den Cloudreve-Container $ct_ip weiter.
+# Idempotent: Regeln werden nur angelegt, wenn sie noch nicht existieren.
+# Erzeugt von install-cloudreve-proxmox.sh - wird beim Boot ueber cloudreve-nat.service ausgefuehrt.
+set -euo pipefail
+PUBLIC_IP="$PUBLIC_IP"
+CT_IP="$ct_ip"
+WAN_IFACE="$WAN_IFACE"
+PORTS="$NAT_PORTS"
+
+add() { # <table> <chain> <rule...>
+  local table=\$1 chain=\$2; shift 2
+  iptables -w -t "\$table" -C "\$chain" "\$@" 2>/dev/null || iptables -w -t "\$table" -A "\$chain" "\$@"
+}
+
+for p in \$PORTS; do
+  add nat PREROUTING -d "\$PUBLIC_IP/32" -p tcp --dport "\$p" -j DNAT --to-destination "\$CT_IP:\$p"
+  add filter FORWARD -d "\$CT_IP/32" -p tcp --dport "\$p" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+done
+add filter FORWARD -s "\$CT_IP/32" -j ACCEPT
+# Ausgehender Traffic des Containers (Updates, Let's Encrypt) ueber die oeffentliche IP
+add nat POSTROUTING -s "\$CT_IP/32" -o "\$WAN_IFACE" -j SNAT --to-source "\$PUBLIC_IP"
+EOF
+  chmod 755 "$NAT_SCRIPT"
+
+  cat > /etc/systemd/system/cloudreve-nat.service <<EOF
+[Unit]
+Description=Cloudreve NAT port forwarding ($PUBLIC_IP -> $ct_ip)
+After=network-online.target pve-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$NAT_SCRIPT
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now cloudreve-nat.service >/dev/null || die "cloudreve-nat.service konnte nicht gestartet werden: journalctl -u cloudreve-nat"
 }
 
 start_container() {
@@ -228,7 +387,7 @@ run_setup() {
   ct_exec env \
     DOMAIN="$DOMAIN" \
     LE_EMAIL="$LE_EMAIL" \
-    PUBLIC_IP="${PUBLIC_IP%%/*}" \
+    PUBLIC_IP="${PUBLIC_IP:-${CT_IP%%/*}}" \
     CLOUDREVE_VERSION="$CLOUDREVE_VERSION" \
     USE_POSTGRES="$USE_POSTGRES" \
     USE_REDIS="$USE_REDIS" \
@@ -246,7 +405,9 @@ print_summary() {
  Fertig. Proxmox-Container #$CTID ($CT_HOSTNAME)
 #############################################################################
  Cloudreve:        https://$DOMAIN
- IP:               ${PUBLIC_IP}${PUBLIC_IP6:+  /  $PUBLIC_IP6}
+ Container-IP:     ${CT_IP} auf ${BRIDGE}${PUBLIC_IP6:+  /  $PUBLIC_IP6}
+ NAT:              $( [[ "$NAT_FORWARD" == "1" ]] && echo "$PUBLIC_IP ($WAN_IFACE) TCP $NAT_PORTS -> ${CT_IP%%/*}  [$NAT_SCRIPT, cloudreve-nat.service]" || echo "keins (Container ist direkt erreichbar)" )
+ Daten:            $( [[ -n "$DATA_HOST_DIR" ]] && echo "$DATA_HOST_DIR (Host) -> $CT_DATA_DIR" || echo "$CT_DATA_DIR im Container" )
  Template:         $TEMPLATE
  Root-Passwort:    $( [[ "${GENERATED_PASSWORD:-0}" == "1" ]] && echo "$CT_PASSWORD  (generiert - bitte notieren!)" || echo "(wie vorgegeben)" )
 
@@ -264,7 +425,9 @@ main() {
   preflight
   locate_setup_script
   ensure_template
+  prepare_data_dir
   create_container
+  setup_nat
   start_container
   set_root_password
   run_setup
