@@ -163,6 +163,7 @@ Die folgenden Variablen werden unverändert an `cloudreve-setup.sh` weitergereic
 | `TIMEZONE` | `Europe/Berlin` | Zeitzone im Container |
 | `INSTALL_DIR` | `/opt/cloudreve` | Installationsverzeichnis |
 | `SERVICE_UID` | `1500` | UID des Service-Users `cloudreve` |
+| `CR_LICENSE_KEY` | leer | Cloudreve-Pro-Lizenzschlüssel (Community, wenn leer) |
 
 Das Container-Script kann auch allein auf einer beliebigen Debian/Ubuntu-VM laufen:
 
@@ -194,6 +195,34 @@ Bei NAT-Betrieb zusätzlich auf dem **Host**:
 /etc/systemd/system/cloudreve-nat.service     führt das Script beim Boot aus
 /etc/sysctl.d/99-cloudreve-forward.conf       net.ipv4.ip_forward = 1
 ```
+
+## Cloudreve Pro
+
+Community und Pro nutzen dasselbe Binary. Die Pro-Lizenz kommt aus dem
+[License-Panel](https://cloudreve.org) als `CR_LICENSE_KEY`. Den Schlüssel nicht in die
+Bash-History tippen:
+
+```bash
+# auf dem Proxmox-Host, Key wird nicht im Klartext in der History gespeichert
+read -rsp "Cloudreve-Pro-Key: " CR_LICENSE_KEY; echo
+pct exec 101 -- env CR_LICENSE_KEY="$CR_LICENSE_KEY" bash -c '
+  install -d -m 0700 /etc/cloudreve
+  umask 077
+  printf "CR_LICENSE_KEY=%s\n" "$CR_LICENSE_KEY" > /etc/cloudreve/license.env
+  chmod 600 /etc/cloudreve/license.env
+  mkdir -p /etc/systemd/system/cloudreve.service.d
+  printf "[Service]\nEnvironmentFile=-/etc/cloudreve/license.env\n" > /etc/systemd/system/cloudreve.service.d/pro.conf
+  systemctl daemon-reload
+  systemctl restart cloudreve
+'
+unset CR_LICENSE_KEY
+```
+
+Danach `https://reichi.cloud` neu laden; unter `/admin` sollte die Pro-Edition sichtbar sein.
+`journalctl -u cloudreve -n 50 --no-pager` im Container zeigt Fehler, falls der Key ungültig ist.
+
+Beim Installer reicht `CR_LICENSE_KEY=... bash install-cloudreve-proxmox.sh` (bzw. `cloudreve-setup.sh`).
+Ein vorhandener Key in `/etc/cloudreve/license.env` wird bei erneutem Setup nicht überschrieben, wenn die Variable leer ist.
 
 ## Betrieb
 

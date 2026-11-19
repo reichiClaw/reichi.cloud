@@ -33,6 +33,7 @@ INSTALL_MEDIA_TOOLS="${INSTALL_MEDIA_TOOLS:-1}" # ffmpeg + libvips fuer Thumbnai
 INSTALL_UNATTENDED_UPGRADES="${INSTALL_UNATTENDED_UPGRADES:-1}"
 SKIP_LETSENCRYPT="${SKIP_LETSENCRYPT:-0}"      # 1 = nur Self-Signed-Zertifikat
 TIMEZONE="${TIMEZONE:-Europe/Berlin}"
+CR_LICENSE_KEY="${CR_LICENSE_KEY:-}"           # Cloudreve Pro; leer = Community. Wird in /etc/cloudreve/license.env gespeichert.
 
 DATA_DIR="$INSTALL_DIR/data"
 # Zertifikate bewusst NICHT auf dem Daten-Share: der erste Install-Lauf legt
@@ -507,6 +508,17 @@ ReadWritePaths=$INSTALL_DIR
 [Install]
 WantedBy=multi-user.target
 EOF
+  mkdir -p /etc/systemd/system/cloudreve.service.d /etc/cloudreve
+  cat > /etc/systemd/system/cloudreve.service.d/pro.conf <<'EOF'
+[Service]
+EnvironmentFile=-/etc/cloudreve/license.env
+EOF
+  if [[ -n "$CR_LICENSE_KEY" ]]; then
+    log "Cloudreve-Pro-Lizenzschluessel speichern ..."
+    umask 077
+    printf 'CR_LICENSE_KEY=%s\n' "$CR_LICENSE_KEY" > /etc/cloudreve/license.env
+    chmod 600 /etc/cloudreve/license.env
+  fi
   systemctl daemon-reload
   systemctl enable cloudreve >/dev/null
   systemctl restart cloudreve
@@ -541,6 +553,7 @@ print_summary() {
  Datenbank:        $( [[ "$USE_POSTGRES" == "1" ]] && echo "PostgreSQL (lokal, DB/User: cloudreve)" || echo "SQLite ($DATA_DIR/cloudreve.db)" )
  Cache:            $( [[ "$USE_REDIS" == "1" ]] && echo "Redis (127.0.0.1:6379)" || echo "In-Memory" )
  HTTP-Redirect:    $( [[ "$HTTP_REDIRECT" == "1" ]] && echo "Port 80 -> https://$DOMAIN" || echo "aus (nur Port 443)" )
+ Lizenz:           $( [[ -s /etc/cloudreve/license.env ]] && echo "Pro (CR_LICENSE_KEY in /etc/cloudreve/license.env)" || echo "Community (Pro: CR_LICENSE_KEY setzen und Dienst neu starten)" )
 
  Naechste Schritte:
    1. https://$DOMAIN oeffnen und den ERSTEN Account registrieren

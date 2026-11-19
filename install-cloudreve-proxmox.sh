@@ -85,6 +85,7 @@ HTTP_REDIRECT="${HTTP_REDIRECT:-1}"
 INSTALL_MEDIA_TOOLS="${INSTALL_MEDIA_TOOLS:-1}"
 SKIP_LETSENCRYPT="${SKIP_LETSENCRYPT:-0}"
 TIMEZONE="${TIMEZONE:-Europe/Berlin}"
+CR_LICENSE_KEY="${CR_LICENSE_KEY:-}"      # Cloudreve Pro; leer = Community. Nicht in die Shell-History tippen, siehe README.
 
 SETUP_SCRIPT_NAME="cloudreve-setup.sh"
 SETUP_SCRIPT_URL="https://raw.githubusercontent.com/reichiClaw/reichi.cloud/main/${SETUP_SCRIPT_NAME}"
@@ -583,6 +584,7 @@ run_setup() {
     INSTALL_MEDIA_TOOLS="$INSTALL_MEDIA_TOOLS" \
     SKIP_LETSENCRYPT="$SKIP_LETSENCRYPT" \
     TIMEZONE="$TIMEZONE" \
+    CR_LICENSE_KEY="$CR_LICENSE_KEY" \
     bash "/root/$SETUP_SCRIPT_NAME"
 }
 
